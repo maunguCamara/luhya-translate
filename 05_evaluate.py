@@ -10,6 +10,7 @@ Usage:
 """
 
 import json
+import math
 import argparse
 from pathlib import Path
 
@@ -23,6 +24,83 @@ def load_eval_pairs(eval_file: str) -> list[dict]:
     return pairs
 
 
+# ── eval_loss extraction ────────────────────────────────────────────────────
+def parse_eval_loss(checkpoint_dir: str | None) -> dict:
+    """
+    Extract eval_loss (and derived perplexity) from TRL/Transformers training artefacts.
+
+    Looks in order:
+      1. trainer_state.json  — written by Trainer every eval step; contains the
+         full log history including {"eval_loss": ..., "step": ...} entries.
+      2. all_results.json    — written by trainer.evaluate() if called explicitly.
+      3. train_results.json  — may include a final eval pass.
+
+    Returns a dict with:
+      best_eval_loss     — lowest eval_loss observed across all steps
+      final_eval_loss    — eval_loss at the last logged eval step
+      best_step          — training step where best_eval_loss was achieved
+      perplexity         — exp(best_eval_loss); lower is better
+      eval_loss_history  — list of {"step", "eval_loss"} for plotting
+      source             — which file the data came from
+    """
+    if not checkpoint_dir:
+        return {}
+
+    cdir = Path(checkpoint_dir)
+    result: dict = {}
+
+    # ── 1. trainer_state.json (most complete source) ──
+    state_path = cdir / "trainer_state.json"
+    if not state_path.exists():
+        # Also check inside checkpoint subdirs (e.g. checkpoint-500/)
+        for sub in sorted(cdir.glob("checkpoint-*")):
+            candidate = sub / "trainer_state.json"
+            if candidate.exists():
+                state_path = candidate
+                break
+
+    if state_path.exists():
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        log_history = state.get("log_history", [])
+
+        eval_entries = [
+            {"step": entry["step"], "eval_loss": entry["eval_loss"]}
+            for entry in log_history
+            if "eval_loss" in entry
+        ]
+
+        if eval_entries:
+            best = min(eval_entries, key=lambda x: x["eval_loss"])
+            final = eval_entries[-1]
+            result = {
+                "best_eval_loss":    round(best["eval_loss"], 6),
+                "final_eval_loss":   round(final["eval_loss"], 6),
+                "best_step":         best["step"],
+                "perplexity":        round(math.exp(best["eval_loss"]), 4),
+                "eval_loss_history": eval_entries,
+                "source":            str(state_path),
+            }
+            return result
+
+    # ── 2. all_results.json ──
+    for fname in ("all_results.json", "train_results.json"):
+        fpath = cdir / fname
+        if fpath.exists():
+            data = json.loads(fpath.read_text(encoding="utf-8"))
+            if "eval_loss" in data:
+                loss = data["eval_loss"]
+                result = {
+                    "best_eval_loss":  round(loss, 6),
+                    "final_eval_loss": round(loss, 6),
+                    "perplexity":      round(math.exp(loss), 4),
+                    "source":          str(fpath),
+                }
+                return result
+
+    # ── 3. Nothing found ──
+    return {"eval_loss_note": f"No eval_loss found in {cdir}. Ensure eval_strategy != 'no'."}
+
+
 def run_evaluation(
     model_dir_or_id: str,
     eval_file: str,
@@ -30,6 +108,7 @@ def run_evaluation(
     n_samples: int = None,
     src_lang: str = "en",
     tgt_lang: str = "luy",
+    checkpoint_dir: str = None,
 ):
     import torch
     from unsloth import FastLanguageModel
@@ -128,17 +207,27 @@ def run_evaluation(
     bleu_score = sacrebleu.corpus_bleu(hypotheses, [references])
     chrf_score = sacrebleu.corpus_chrf(hypotheses, [references], beta=2)
 
+    # Parse eval_loss from training checkpoints
+    eval_loss_data = parse_eval_loss(checkpoint_dir)
+
     results = {
         "model": model_dir_or_id,
         "eval_pairs": len(pairs),
-        "BLEU": round(bleu_score.score, 4),
+        "BLEU":   round(bleu_score.score, 4),
         "chrF++": round(chrf_score.score, 4),
+        **eval_loss_data,            # merges best_eval_loss, perplexity, history, etc.
         "samples": sample_output,
     }
 
     print(f"\n{'='*40}")
-    print(f"  BLEU    : {results['BLEU']}")
-    print(f"  chrF++  : {results['chrF++']}")
+    print(f"  BLEU        : {results['BLEU']}")
+    print(f"  chrF++      : {results['chrF++']}")
+    if "best_eval_loss" in results:
+        print(f"  eval_loss   : {results['best_eval_loss']}  (best at step {results.get('best_step','?')})")
+        print(f"  perplexity  : {results['perplexity']}")
+        print(f"  final loss  : {results.get('final_eval_loss', 'n/a')}")
+    elif "eval_loss_note" in results:
+        print(f"  eval_loss   : {results['eval_loss_note']}")
     print(f"{'='*40}\n")
 
     print("Sample translations:")
@@ -158,11 +247,14 @@ def run_evaluation(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-dir",  default=None, help="Local path to merged model or LoRA adapter")
-    parser.add_argument("--model-id",   default=None, help="HuggingFace Hub model ID")
-    parser.add_argument("--eval-file",  default="data/processed/eval.jsonl")
-    parser.add_argument("--output",     default="evaluation/results.json")
-    parser.add_argument("--n-samples",  type=int, default=None, help="Limit eval set size")
+    parser.add_argument("--model-dir",       default=None, help="Local path to merged model or LoRA adapter")
+    parser.add_argument("--model-id",        default=None, help="HuggingFace Hub model ID")
+    parser.add_argument("--eval-file",       default="data/processed/eval.jsonl")
+    parser.add_argument("--output",          default="evaluation/results.json")
+    parser.add_argument("--n-samples",       type=int, default=None, help="Limit eval set size")
+    parser.add_argument("--checkpoint-dir",  default="training/checkpoints",
+                        help="TRL checkpoint directory containing trainer_state.json "
+                             "(used to parse eval_loss history). Defaults to training/checkpoints.")
     args = parser.parse_args()
 
     model_ref = args.model_dir or args.model_id
@@ -175,4 +267,5 @@ if __name__ == "__main__":
         eval_file=str(base / args.eval_file),
         output_file=str(base / args.output),
         n_samples=args.n_samples,
+        checkpoint_dir=str(base / args.checkpoint_dir),
     )
