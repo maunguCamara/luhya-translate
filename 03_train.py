@@ -38,6 +38,22 @@ class TrainConfig:
     output_dir: str = "training/checkpoints"
     hub_model_id: Optional[str] = None          # set to "yourname/luhya_translategemma_4b_v1"
 
+    # Quantization
+    # ─────────────────────────────────────────────────────────────────────────
+    # Default: full bf16 (best quality, ~14GB VRAM for 4B model + r=256 adapter).
+    # Set load_in_4bit=True if your GPU has < 16GB VRAM (e.g. A10G, T4, 3090).
+    # 4-bit uses bitsandbytes NF4 + double quant; quality penalty is small
+    # (~0.5–1.5 BLEU) but VRAM drops to ~7GB, making a 16GB GPU viable.
+    # When load_in_4bit=True the optimizer automatically falls back to
+    # paged_adamw_8bit to keep optimizer states off-device.
+    # ─────────────────────────────────────────────────────────────────────────
+    load_in_4bit: bool = False
+
+    # HuggingFace token (for push_to_hub and gated model access)
+    # Set via env var HUGGINGFACE_TOKEN or pass --hf-token on CLI.
+    # Never hard-code the token here.
+    huggingface_token: Optional[str] = None
+
     # Data
     train_file: str = "data/augmented/train_augmented.jsonl"
     eval_file:  str = "data/processed/eval.jsonl"
@@ -152,14 +168,32 @@ def train(cfg: TrainConfig):
     print(f"  Base model : {cfg.base_model}")
     print(f"  LoRA       : r={cfg.lora_rank}, alpha={cfg.lora_alpha}, rsLoRA={cfg.use_rslora}")
     print(f"  Epochs     : {cfg.num_train_epochs}")
+    print(f"  4-bit quant: {cfg.load_in_4bit}")
     print(f"  Lang codes : {cfg.src_lang} → {cfg.tgt_lang}\n")
 
+    # ── HuggingFace authentication ──
+    # Resolves in priority order: explicit token > HUGGINGFACE_TOKEN env var > cached login.
+    # Required for: push_to_hub, and any gated model on the Hub.
+    hf_token = cfg.huggingface_token or os.environ.get("HUGGINGFACE_TOKEN")
+    if hf_token:
+        from huggingface_hub import login as hf_login
+        hf_login(token=hf_token, add_to_git_credential=False)
+        print("  HuggingFace: authenticated via token ✓")
+    else:
+        print("  HuggingFace: no token found — using cached credentials (if any)")
+        print("               Set HUGGINGFACE_TOKEN env var or pass --hf-token to enable push_to_hub")
+
     # ── load base model ──
+    # 4-bit path: NF4 quantization via bitsandbytes, optimizer auto-switched to paged_adamw_8bit
+    if cfg.load_in_4bit:
+        print("  Loading in 4-bit (NF4) — VRAM ~7GB, slight quality trade-off")
+        cfg.optim = "paged_adamw_8bit"   # keeps optimizer states paged to CPU
     model, processor = FastLanguageModel.from_pretrained(
         model_name=cfg.base_model,
         max_seq_length=cfg.max_seq_length,
-        dtype=None,          # auto-detect bf16
-        load_in_4bit=False,  # full bf16 for quality; set True if < 16GB VRAM
+        dtype=None,
+        load_in_4bit=cfg.load_in_4bit,
+        token=hf_token,
     )
 
     # ── attach LoRA adapter ──
@@ -252,9 +286,11 @@ def train(cfg: TrainConfig):
 
     # ── optionally push to Hub ──
     if cfg.hub_model_id:
+        if not hf_token and not os.environ.get("HUGGINGFACE_TOKEN"):
+            print("  ⚠ No HUGGINGFACE_TOKEN found — push_to_hub may fail if not logged in via CLI")
         print(f"Pushing to Hub: {cfg.hub_model_id}")
-        model.push_to_hub(cfg.hub_model_id)
-        text_tokenizer.push_to_hub(cfg.hub_model_id)
+        model.push_to_hub(cfg.hub_model_id, token=hf_token)
+        text_tokenizer.push_to_hub(cfg.hub_model_id, token=hf_token)
         print("Done! ✓")
 
     return model, text_tokenizer, processor
@@ -301,18 +337,24 @@ if __name__ == "__main__":
     parser.add_argument("--local",       action="store_true", help="Run locally (not via Modal)")
     parser.add_argument("--smoke-test",  action="store_true", help="Tiny run for debugging")
     parser.add_argument("--hub-id",      default=None,        help="HuggingFace Hub model ID to push to")
+    parser.add_argument("--hf-token",    default=None,        help="HuggingFace token (overrides HUGGINGFACE_TOKEN env var)")
+    parser.add_argument("--4bit",        dest="load_in_4bit", action="store_true",
+                        help="Load model in 4-bit NF4 (reduces VRAM from ~14GB to ~7GB; "
+                             "auto-switches optimizer to paged_adamw_8bit)")
     parser.add_argument("--epochs",      type=int, default=5)
     parser.add_argument("--rank",        type=int, default=256)
     parser.add_argument("--train-file",  default="data/augmented/train_augmented.jsonl")
     parser.add_argument("--eval-file",   default="data/processed/eval.jsonl")
     args = parser.parse_args()
 
-    CFG.num_train_epochs = args.epochs
-    CFG.lora_rank        = args.rank
-    CFG.hub_model_id     = args.hub_id
-    CFG.smoke_test       = args.smoke_test
-    CFG.train_file       = args.train_file
-    CFG.eval_file        = args.eval_file
+    CFG.num_train_epochs    = args.epochs
+    CFG.lora_rank           = args.rank
+    CFG.hub_model_id        = args.hub_id
+    CFG.smoke_test          = args.smoke_test
+    CFG.train_file          = args.train_file
+    CFG.eval_file           = args.eval_file
+    CFG.load_in_4bit        = args.load_in_4bit
+    CFG.huggingface_token   = args.hf_token or os.environ.get("HUGGINGFACE_TOKEN")
 
     model, text_tokenizer, processor = train(CFG)
 
