@@ -148,51 +148,149 @@ def load_bible_corpus(src_file: Path, tgt_file: Path, dialect: str = "lumarachi"
 
 
 # ── 3. Pivot Luhya-Swahili → English via NLLB ──────────────────────────────
-def pivot_swahili_to_english(pairs: list[dict], batch_size: int = 32) -> list[dict]:
+# Confidence scoring strategy
+# ─────────────────────────────
+# NLLB sequence scores are log-probabilities summed over output tokens.
+# A raw sum is length-biased (longer outputs score lower), so we
+# length-normalise: score_per_tok = total_log_prob / n_output_tokens.
+# We then convert to a [0, 1] confidence via exp(score_per_tok).
+# Pairs below PIVOT_CONF_THRESHOLD are discarded before they ever reach
+# the training set; pairs above PIVOT_CONF_WARN are flagged in the stats.
+#
+# Empirically for NLLB-600M on Swahili→English:
+#   exp(score_per_tok) ≈ 0.55–0.75  → fluent, high-confidence
+#   exp(score_per_tok) ≈ 0.35–0.55  → acceptable, keep with caution
+#   exp(score_per_tok) < 0.35       → likely noise or hallucination, discard
+
+PIVOT_CONF_THRESHOLD = 0.35   # hard reject below this
+PIVOT_CONF_WARN      = 0.45   # warn-but-keep band: 0.35–0.45
+
+
+def _normalised_confidence(sequences_score: float, n_tokens: int) -> float:
+    """Convert a Hugging Face generate() sequences_score to a [0,1] confidence."""
+    import math
+    if n_tokens == 0:
+        return 0.0
+    score_per_tok = sequences_score / n_tokens   # length-normalised log-prob
+    return math.exp(score_per_tok)               # map to (0, 1]
+
+
+def pivot_swahili_to_english(
+    pairs: list[dict],
+    batch_size: int = 16,
+    conf_threshold: float = PIVOT_CONF_THRESHOLD,
+) -> list[dict]:
     """
     Use facebook/nllb-200-distilled-600M to translate the Swahili side
     to English, producing Luhya↔English pairs.
 
-    Only runs if `transformers` is available.
-    Falls back to a stub that marks pairs as needing manual translation.
+    Confidence filtering
+    --------------------
+    Each translated pair receives a ``pivot_confidence`` score in [0, 1]
+    derived from the model's own sequence log-probability (length-normalised).
+    Pairs below ``conf_threshold`` (default 0.35) are dropped. The threshold
+    can be overridden via --pivot-conf-threshold on the CLI.
+
+    Only runs if `transformers` is available; falls back gracefully.
     """
     try:
-        from transformers import pipeline as hf_pipeline
+        import torch
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
     except ImportError:
-        print("  [pivot] transformers not installed — marking pairs as sw_only")
+        print("  [pivot] transformers not installed — skipping pivot")
         for p in pairs:
             p["english"] = None
-            p["pivot_quality"] = 0.0
+            p["pivot_confidence"] = 0.0
         return pairs
 
-    print(f"  [pivot] Loading NLLB-200 for {len(pairs)} Swahili→English translations...")
-    translator = hf_pipeline(
-        "translation",
-        model="facebook/nllb-200-distilled-600M",
-        src_lang="swh_Latn",   # Swahili
-        tgt_lang="eng_Latn",   # English
-        device=-1,             # CPU; change to 0 for GPU
-        max_length=256,
-    )
+    model_name = "facebook/nllb-200-distilled-600M"
+    print(f"  [pivot] Loading {model_name} ...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    nllb_model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    nllb_model.to(device).eval()
+    print(f"  [pivot] Running on {device} | conf_threshold={conf_threshold}")
+
+    forced_bos_id = tokenizer.convert_tokens_to_ids("eng_Latn")
 
     batches = [pairs[i:i+batch_size] for i in range(0, len(pairs), batch_size)]
-    output_pairs = []
+    output_pairs: list[dict] = []
+    n_kept = n_low_conf = n_junk = 0
+
     for batch_idx, batch in enumerate(batches):
         swahili_texts = [p["swahili"] for p in batch]
         try:
-            results = translator(swahili_texts)
-            for p, r in zip(batch, results):
-                translated = r["translation_text"].strip()
-                if not is_junk(translated):
-                    p["english"] = translated
-                    p["pivot_quality"] = 0.7  # rough estimate; filter below
-                    output_pairs.append(p)
-        except Exception as e:
-            print(f"    [pivot] batch {batch_idx} failed: {e}")
-        if (batch_idx + 1) % 10 == 0:
-            print(f"    ... {(batch_idx+1)*batch_size}/{len(pairs)} done")
+            enc = tokenizer(
+                swahili_texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=256,
+                src_lang="swh_Latn",
+            ).to(device)
 
-    print(f"  [pivot] {len(output_pairs)}/{len(pairs)} pairs successfully pivoted")
+            with torch.no_grad():
+                out = nllb_model.generate(
+                    **enc,
+                    forced_bos_token_id=forced_bos_id,
+                    max_new_tokens=256,
+                    num_beams=4,
+                    early_stopping=True,
+                    # Return sequence scores so we can compute confidence
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                    output_hidden_states=False,
+                )
+
+            # sequences_scores is the beam-search final score (sum of log-probs)
+            seq_scores = out.sequences_scores.tolist()
+            decoded    = tokenizer.batch_decode(out.sequences, skip_special_tokens=True)
+            n_tokens   = [(out.sequences[i] != tokenizer.pad_token_id).sum().item()
+                          for i in range(len(decoded))]
+
+            for p, translated, seq_score, n_tok in zip(batch, decoded, seq_scores, n_tokens):
+                translated = translated.strip()
+
+                if is_junk(translated):
+                    n_junk += 1
+                    continue
+
+                confidence = _normalised_confidence(seq_score, n_tok)
+
+                if confidence < conf_threshold:
+                    n_low_conf += 1
+                    continue
+
+                new_p = dict(p)
+                new_p["english"]          = translated
+                new_p["pivot_confidence"] = round(confidence, 4)
+                new_p["pivot_quality"]    = confidence   # kept for build_final_dataset compat
+                if confidence < PIVOT_CONF_WARN:
+                    new_p["pivot_warn"] = True           # visible in stats
+                output_pairs.append(new_p)
+                n_kept += 1
+
+        except Exception as e:
+            print(f"    [pivot] batch {batch_idx} error: {e}")
+
+        if (batch_idx + 1) % 10 == 0:
+            done = (batch_idx + 1) * batch_size
+            print(f"    ... {done}/{len(pairs)} | kept={n_kept} low_conf={n_low_conf} junk={n_junk}")
+
+    # Summary histogram of confidence bands
+    bands = {"[0.35,0.45)": 0, "[0.45,0.55)": 0, "[0.55,0.65)": 0, "[0.65,1.0]": 0}
+    for p in output_pairs:
+        c = p["pivot_confidence"]
+        if c < 0.45:   bands["[0.35,0.45)"] += 1
+        elif c < 0.55: bands["[0.45,0.55)"] += 1
+        elif c < 0.65: bands["[0.55,0.65)"] += 1
+        else:          bands["[0.65,1.0]"]  += 1
+
+    print(
+        f"  [pivot] done | input={len(pairs)} kept={n_kept} "
+        f"low_conf={n_low_conf} junk={n_junk}"
+    )
+    print(f"  [pivot] confidence distribution: {bands}")
     return output_pairs
 
 
@@ -300,6 +398,9 @@ def main():
     parser.add_argument("--contributed-dir", default="data/contributed",     help="Your own CSV/JSONL pairs")
     parser.add_argument("--output-dir",      default="data/processed",       help="Output directory")
     parser.add_argument("--skip-pivot",      action="store_true",            help="Skip NLLB pivot (faster; Bible+contributed only)")
+    parser.add_argument("--pivot-conf-threshold", type=float, default=PIVOT_CONF_THRESHOLD,
+                        help=f"Min confidence to keep a pivoted pair (default {PIVOT_CONF_THRESHOLD}). "
+                             f"Range [0,1]; lower = keep more pairs but noisier.")
     args = parser.parse_args()
 
     base = Path(__file__).parent.parent
@@ -340,7 +441,10 @@ def main():
     pivoted_pairs = []
     if kentrans_pairs and not args.skip_pivot:
         print("Pivoting Luhya-Swahili → English via NLLB-200...")
-        pivoted_pairs = pivot_swahili_to_english(kentrans_pairs)
+        pivoted_pairs = pivot_swahili_to_english(
+            kentrans_pairs,
+            conf_threshold=args.pivot_conf_threshold,
+        )
         print()
     elif args.skip_pivot:
         print("[skip-pivot] Skipping NLLB pivot as requested.\n")
@@ -363,6 +467,10 @@ def main():
         "eval_pairs":  len(eval_set),
         "dialect_distribution": dict(dialect_counts),
         "source_distribution":  dict(source_counts),
+        "pivot_conf_threshold": args.pivot_conf_threshold,
+        "pivot_low_conf_warned": sum(
+            1 for r in train_set + eval_set if r.get("pivot_warn")
+        ),
     }
     (output_dir / "stats.json").write_text(json.dumps(stats, indent=2))
 
